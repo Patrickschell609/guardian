@@ -1,0 +1,8 @@
+services:
+  guardian:
+    build: .
+    env_file: .env
+    volumes:
+      - ./guardian_vault.db:/app/guardian_vault.db
+      - ./guardian_graph.db:/app/guardian_graph.db
+    command: ["demo"]
