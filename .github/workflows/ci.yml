@@ -10,6 +10,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    env:
+      PYTHONPATH: ${{ github.workspace }}/..
+
     steps:
       - uses: actions/checkout@v4
 
@@ -26,12 +29,7 @@ jobs:
           python -c "from guardian import config; from guardian.sensors.persistence import scan_package; from guardian.analysis.graph import IntelGraph; from guardian.evaluator import evaluate; print('All imports OK')"
 
       - name: Run tests
-        run: |
-          if [ -d tests/ ]; then
-            python -m pytest tests/ -v
-          else
-            echo "No tests/ directory found, skipping pytest"
-          fi
+        run: python -m pytest tests/ -v
 
       - name: Verify CLI
         run: python -m guardian.cli --help
