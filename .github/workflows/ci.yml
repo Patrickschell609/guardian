@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify imports
+        run: |
+          python -c "from guardian import config; from guardian.sensors.persistence import scan_package; from guardian.analysis.graph import IntelGraph; from guardian.evaluator import evaluate; print('All imports OK')"
+
+      - name: Run tests
+        run: |
+          if [ -d tests/ ]; then
+            python -m pytest tests/ -v
+          else
+            echo "No tests/ directory found, skipping pytest"
+          fi
+
+      - name: Verify CLI
+        run: python -m guardian.cli --help
