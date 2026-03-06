@@ -138,9 +138,13 @@ def call_model(model_key: str, prompt: str) -> str:
         return f"ERROR from {model_key} ({model}): {str(e)}"
 
 
-def run_relay(problem: str, verbose: bool = True, use_vault: bool = True) -> dict:
+def run_relay(problem: str, verbose: bool = True, use_vault: bool = True, stages_override: list = None) -> dict:
     """
-    Run the full relay chain. Returns dict with output, model_chain, elapsed, score.
+    Run the relay chain. Returns dict with output, model_chain, elapsed, score.
+
+    Args:
+        stages_override: If provided, only run stages whose name is in this list.
+                         e.g. ["IDEATION", "ANALYSIS", "REASONING"] for --fast mode.
     """
     total_start = datetime.now()
 
@@ -170,14 +174,19 @@ def run_relay(problem: str, verbose: bool = True, use_vault: bool = True) -> dic
     previous_output = ""
     model_chain = []
 
-    for i, stage in enumerate(STAGES):
+    active_stages = STAGES
+    if stages_override:
+        active_stages = [s for s in STAGES if s["name"] in stages_override]
+
+    total = len(active_stages)
+    for i, stage in enumerate(active_stages):
         stage_name = stage["name"]
         model_key = stage["model"]
         model_chain.append(model_key)
 
         if verbose:
             model_id = config.RELAY_MODELS.get(model_key, "?")
-            print(f"\n  Stage {i+1}/5: {stage_name} ({model_id})")
+            print(f"\n  Stage {i+1}/{total}: {stage_name} ({model_id})")
 
         prompt = stage["prompt"].format(
             problem=problem,

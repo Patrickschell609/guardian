@@ -31,6 +31,11 @@ def main():
     scan_parser.add_argument("path", help="Path to scan, or pypi:<package> for PyPI")
     scan_parser.add_argument("--json", action="store_true", help="JSON output")
     scan_parser.add_argument("--quiet", "-q", action="store_true", help="Minimal output")
+    mode_group = scan_parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--cheap", action="store_true",
+                            help="Single-model analysis only (skip relay and evaluator)")
+    mode_group.add_argument("--fast", action="store_true",
+                            help="Shortened 3-stage relay, skip evaluator")
 
     # watch
     watch_parser = subparsers.add_parser("watch", help="Continuous monitoring")
@@ -67,7 +72,9 @@ def main():
 
     if args.command == "scan":
         verbose = not getattr(args, 'quiet', False)
-        result = run_scan(args.path, verbose=verbose)
+        result = run_scan(args.path, verbose=verbose,
+                          cheap=getattr(args, 'cheap', False),
+                          fast=getattr(args, 'fast', False))
         if getattr(args, 'json', False):
             print(json.dumps(result, indent=2, default=str))
         elif not verbose:

@@ -79,24 +79,83 @@ def _alerts_to_graph(alerts: list, graph: IntelGraph, source_id: str):
         graph.add_node(node)
 
 
-def run_scan(path: str, verbose: bool = True) -> dict:
+def _cheap_assess(finding_summary: str, severity_counts: dict, verbose: bool = True) -> dict:
+    """Single-model assessment for --cheap mode. No relay, no evaluator."""
+    import litellm
+
+    prompt = f"""You are a threat analyst. Assess these findings and respond in JSON:
+
+FINDINGS:
+{finding_summary}
+
+Respond with:
+{{
+    "verdict": "THREAT" | "BENIGN" | "UNCERTAIN",
+    "score": <1-10>,
+    "reasoning": "brief explanation"
+}}"""
+
+    if verbose:
+        print(f"\n  [4/4] ASSESS (cheap) - Single-model analysis with {config.RELAY_MODELS['primary']}...")
+
+    try:
+        response = litellm.completion(
+            model=config.RELAY_MODELS["primary"],
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1024,
+            temperature=0.3,
+        )
+        text = response.choices[0].message.content
+        try:
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0].strip()
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0].strip()
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = None
+
+        if data:
+            return {
+                "verdict": data.get("verdict", "UNCERTAIN"),
+                "score": int(data.get("score", 5)),
+                "reasoning": data.get("reasoning", ""),
+            }
+    except Exception as e:
+        if verbose:
+            print(f"    Model error: {e}")
+
+    # Fallback: score based on severity counts
+    crit = severity_counts.get("CRITICAL", 0)
+    high = severity_counts.get("HIGH", 0)
+    score = min(10, crit * 3 + high * 2 + 1)
+    verdict = "THREAT" if score >= 7 else ("UNCERTAIN" if score >= 4 else "BENIGN")
+    return {"verdict": verdict, "score": score, "reasoning": "Scored from severity counts (model fallback)"}
+
+
+def run_scan(path: str, verbose: bool = True, cheap: bool = False, fast: bool = False) -> dict:
     """
     SCAN mode: One-shot scan of a package/directory.
 
-    SENSE -> GRAPH -> PATTERNS -> RELAY -> EVALUATE -> VAULT
+    Default: SENSE -> GRAPH -> PATTERNS -> RELAY -> EVALUATE -> VAULT
+    --cheap: SENSE -> GRAPH -> PATTERNS -> single-model ASSESS (skip relay + evaluator)
+    --fast:  SENSE -> GRAPH -> PATTERNS -> 3-stage RELAY (skip evaluator)
     """
     start = datetime.now()
-    results = {"mode": "scan", "path": path, "stages": {}}
+    mode_label = " (cheap)" if cheap else (" (fast)" if fast else "")
+    results = {"mode": "scan" + mode_label, "path": path, "stages": {}}
+
+    total_stages = 4 if cheap else (5 if fast else 6)
 
     if verbose:
         print(f"\n{'='*60}")
-        print(f"  GUARDIAN SCAN")
+        print(f"  GUARDIAN SCAN{mode_label.upper()}")
         print(f"  Target: {path}")
         print(f"{'='*60}")
 
     # === STAGE 1: SENSE ===
     if verbose:
-        print(f"\n  [1/6] SENSE - Running persistence scanner...")
+        print(f"\n  [1/{total_stages}] SENSE - Running persistence scanner...")
 
     if path.startswith("pypi:"):
         pkg_name = path[5:]
@@ -121,7 +180,7 @@ def run_scan(path: str, verbose: bool = True) -> dict:
 
     # === STAGE 2: GRAPH ===
     if verbose:
-        print(f"\n  [2/6] GRAPH - Building knowledge graph...")
+        print(f"\n  [2/{total_stages}] GRAPH - Building knowledge graph...")
 
     graph = IntelGraph()
     _findings_to_graph(scan_result, graph, source_id="persistence_scan")
@@ -133,7 +192,7 @@ def run_scan(path: str, verbose: bool = True) -> dict:
 
     # === STAGE 3: PATTERNS ===
     if verbose:
-        print(f"\n  [3/6] PATTERNS - Detecting clusters...")
+        print(f"\n  [3/{total_stages}] PATTERNS - Detecting clusters...")
 
     engine = PatternEngine(graph=graph)
     patterns = engine.detect_all()
@@ -144,11 +203,7 @@ def run_scan(path: str, verbose: bool = True) -> dict:
     if verbose:
         print(f"    {len(patterns)} patterns detected")
 
-    # === STAGE 4: RELAY ===
-    if verbose:
-        print(f"\n  [4/6] RELAY - Cross-family analysis...")
-
-    # Build finding summary for relay
+    # Build finding summary for relay/assessment
     severity_counts = {}
     for f in scan_result.findings:
         severity_counts[f.severity] = severity_counts.get(f.severity, 0) + 1
@@ -162,58 +217,101 @@ def run_scan(path: str, verbose: bool = True) -> dict:
     for f in scan_result.findings[:10]:
         finding_summary += f"  [{f.severity}] {f.category} in {Path(f.file).name}:{f.line} - {f.context[:80]}\n"
 
-    relay_result = run_relay(finding_summary, verbose=verbose)
-    results["stages"]["relay"] = {
-        "model_chain": relay_result["model_chain"],
-        "elapsed": relay_result["elapsed"],
-        "score": relay_result["score"],
-    }
+    if cheap:
+        # === CHEAP MODE: Single-model assessment, no relay, no evaluator ===
+        assess = _cheap_assess(finding_summary, severity_counts, verbose=verbose)
+        results["stages"]["assess"] = assess
 
-    # === STAGE 5: EVALUATE ===
-    if verbose:
-        print(f"\n  [5/6] EVALUATE - Bounded recursion consensus...")
+        final_score = assess["score"]
+        results["verdict"] = assess["verdict"]
+        results["confidence"] = "SINGLE_MODEL"
+        results["score"] = final_score
 
-    eval_result = evaluate(
-        assessment=relay_result["output"],
-        context=finding_summary,
-    )
-    results["stages"]["evaluate"] = {
-        "confidence_level": eval_result["confidence_level"],
-        "consensus_verdict": eval_result.get("consensus_verdict", "?"),
-        "consensus_score": eval_result["consensus_score"],
-        "agreement_map": eval_result.get("agreement_map", {}),
-    }
-
-    if verbose:
-        print(format_evaluation(eval_result))
-
-    # === STAGE 6: VAULT ===
-    if verbose:
-        print(f"\n  [6/6] VAULT - Archiving...")
-
-    final_score = round(eval_result["consensus_score"])
-    if final_score >= config.CONFIDENCE_THRESHOLD:
-        init_vault()
-        save_solution(
-            problem=f"scan:{path}",
-            solution=json.dumps({
-                "relay_output": relay_result["output"][:3000],
-                "evaluation": {k: v for k, v in eval_result.items() if k != "verdicts"},
-                "scan_summary": severity_counts,
-            }, default=str),
-            score=final_score,
-            model_chain="->".join(relay_result["model_chain"]),
-            elapsed=relay_result["elapsed"],
-        )
+    elif fast:
+        # === FAST MODE: 3-stage relay (IDEATION, ANALYSIS, REASONING), no evaluator ===
         if verbose:
-            print(f"    Archived (score {final_score}/10 >= threshold {config.CONFIDENCE_THRESHOLD})")
-    elif verbose:
-        print(f"    Skipped (score {final_score}/10 < threshold {config.CONFIDENCE_THRESHOLD})")
+            print(f"\n  [4/{total_stages}] RELAY (fast) - 3-stage cross-family analysis...")
 
-    # Final verdict
-    results["verdict"] = eval_result.get("consensus_verdict", "UNCERTAIN")
-    results["confidence"] = eval_result["confidence_level"]
-    results["score"] = eval_result["consensus_score"]
+        relay_result = run_relay(finding_summary, verbose=verbose, stages_override=["IDEATION", "ANALYSIS", "REASONING"])
+        results["stages"]["relay"] = {
+            "model_chain": relay_result["model_chain"],
+            "elapsed": relay_result["elapsed"],
+            "score": relay_result["score"],
+        }
+
+        final_score = relay_result["score"]
+        # Derive verdict from relay score
+        if final_score >= 7:
+            verdict = "THREAT"
+        elif final_score >= 4:
+            verdict = "UNCERTAIN"
+        else:
+            verdict = "BENIGN"
+
+        results["verdict"] = verdict
+        results["confidence"] = "RELAY_ONLY"
+        results["score"] = final_score
+
+    else:
+        # === DEFAULT: Full pipeline ===
+
+        # === STAGE 4: RELAY ===
+        if verbose:
+            print(f"\n  [4/{total_stages}] RELAY - Cross-family analysis...")
+
+        relay_result = run_relay(finding_summary, verbose=verbose)
+        results["stages"]["relay"] = {
+            "model_chain": relay_result["model_chain"],
+            "elapsed": relay_result["elapsed"],
+            "score": relay_result["score"],
+        }
+
+        # === STAGE 5: EVALUATE ===
+        if verbose:
+            print(f"\n  [5/{total_stages}] EVALUATE - Bounded recursion consensus...")
+
+        eval_result = evaluate(
+            assessment=relay_result["output"],
+            context=finding_summary,
+        )
+        results["stages"]["evaluate"] = {
+            "confidence_level": eval_result["confidence_level"],
+            "consensus_verdict": eval_result.get("consensus_verdict", "?"),
+            "consensus_score": eval_result["consensus_score"],
+            "agreement_map": eval_result.get("agreement_map", {}),
+        }
+
+        if verbose:
+            print(format_evaluation(eval_result))
+
+        # === STAGE 6: VAULT ===
+        if verbose:
+            print(f"\n  [6/{total_stages}] VAULT - Archiving...")
+
+        final_score = round(eval_result["consensus_score"])
+        if final_score >= config.CONFIDENCE_THRESHOLD:
+            init_vault()
+            save_solution(
+                problem=f"scan:{path}",
+                solution=json.dumps({
+                    "relay_output": relay_result["output"][:3000],
+                    "evaluation": {k: v for k, v in eval_result.items() if k != "verdicts"},
+                    "scan_summary": severity_counts,
+                }, default=str),
+                score=final_score,
+                model_chain="->".join(relay_result["model_chain"]),
+                elapsed=relay_result["elapsed"],
+            )
+            if verbose:
+                print(f"    Archived (score {final_score}/10 >= threshold {config.CONFIDENCE_THRESHOLD})")
+        elif verbose:
+            print(f"    Skipped (score {final_score}/10 < threshold {config.CONFIDENCE_THRESHOLD})")
+
+        # Final verdict
+        results["verdict"] = eval_result.get("consensus_verdict", "UNCERTAIN")
+        results["confidence"] = eval_result["confidence_level"]
+        results["score"] = eval_result["consensus_score"]
+
     results["elapsed"] = (datetime.now() - start).total_seconds()
 
     if verbose:
